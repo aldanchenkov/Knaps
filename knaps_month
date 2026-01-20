@@ -1,0 +1,487 @@
+import geopandas as gpd
+import pandas as pd
+import numpy as np
+from shapely.geometry import LineString, Point
+import openmeteo_requests
+import requests_cache
+from retry_requests import retry
+import matplotlib.pyplot as plt
+from windrose import WindroseAxes
+from scipy import interpolate
+import warnings
+import traceback
+import os
+
+warnings.filterwarnings('ignore')
+plt.ioff()
+
+print("=" * 80)
+print("ЗАГРУЗКА ДАННЫХ")
+print("=" * 80)
+
+shoreline_gdf = gpd.read_file('D:/PyProjects/Knaps/coastline_sms.shp', crs="EPSG:32634")
+print(f"✓ Береговая линия загружена: {len(shoreline_gdf)} записей")
+
+transects_gdf = gpd.read_file('D:/PyProjects/Knaps/transects_gdf_era5utm.shp', crs="EPSG:32634")
+print(f"✓ Трансекты загружены: {len(transects_gdf)} записей")
+
+calc_gdf = gpd.GeoDataFrame(
+    transects_gdf.copy(),
+    geometry=gpd.points_from_xy(transects_gdf.INSIDE_X, transects_gdf.INSIDE_Y),
+    crs="EPSG:32634"
+)
+print(f"✓ GeoDataFrame создан")
+
+shoreline_union = shoreline_gdf.geometry.unary_union
+print(f"✓ Берег объединен в одну геометрию (для быстрого поиска)")
+
+rhumb_sectors = 32
+speed_bins = 4
+years_range = range(1975, 2025)
+months_range = range(1, 13)
+
+print("\n" + "=" * 80)
+print("ПАРАМЕТРЫ")
+print("=" * 80)
+print(f"Годы: {list(years_range)}")
+print(f"Месяцы: {list(months_range)}")
+print(f"Всего расчетов: {len(calc_gdf)} × {len(years_range)} × {len(months_range)} = {len(calc_gdf) * len(years_range) * len(months_range)}")
+
+
+def calculate_distance_fast(point_x, point_y, angle, shoreline_union, max_distance=700000):
+    """Расчёт расстояния до берега в заданном направлении"""
+    angle_rad = np.radians(angle)
+    dx = np.cos(angle_rad)
+    dy = np.sin(angle_rad)
+    end_point = Point(point_x + dx * max_distance, point_y + dy * max_distance)
+    ray = LineString([(point_x, point_y), (end_point.x, end_point.y)])
+    intersection = ray.intersection(shoreline_union)
+
+    if not intersection.is_empty:
+        return Point(point_x, point_y).distance(intersection)
+    else:
+        return None
+
+
+def get_fetch_distances(point_x, point_y, angles, shoreline_union):
+    """Получение расстояний fetch по направлениям"""
+    distances = []
+    directions = []
+
+    for angle in angles:
+        distance = calculate_distance_fast(point_x, point_y, angle, shoreline_union)
+        if distance is not None:
+            distances.append(distance / 1000)
+            directions.append((90 - angle) % 360)
+        else:
+            distances.append(0)
+            directions.append((90 - angle) % 360)
+
+    return np.array(directions), np.array(distances)
+
+
+# ============ ПРЕДВАРИТЕЛЬНЫЙ РАСЧЁТ КЕША FETCH-ДИСТАНЦИЙ ============
+print("\n" + "=" * 80)
+print("РАСЧЁТ FETCH-ДИСТАНЦИЙ (кеширование по точкам)")
+print("=" * 80)
+
+# создаём массив углов для fetch (все 32 направления, СОВПАДАЮЩИХ с windrose)
+fetch_angles = np.linspace(0, 360, rhumb_sectors, endpoint=False) + 360 / (2 * rhumb_sectors)
+
+# кеш: ключ = (point_x, point_y), значение = (directions, distances)
+fetch_cache = {}
+
+for idx, row in calc_gdf.iterrows():
+    point_x = row['INSIDE_X']
+    point_y = row['INSIDE_Y']
+    cache_key = (point_x, point_y)
+
+    if cache_key not in fetch_cache:
+        directions, distances = get_fetch_distances(point_x, point_y, fetch_angles, shoreline_union)
+        fetch_cache[cache_key] = (directions, distances)
+
+print(f"✓ Кеширование завершено: {len(fetch_cache)} уникальных точек")
+
+
+# ============ ФУНКЦИИ РАСЧЁТА ============
+
+def round_dir(direction, directions):
+    """Округление направления к ближайшему сектору"""
+    closest = min(directions, key=lambda x: abs(x - direction))
+    return closest
+
+
+def filter_active_rumbs(df, normal_to_beach, wind_direction_column='wind_direction'):
+    """Фильтр активных румбов (±90° от нормали к берегу)"""
+    lower_bound = (normal_to_beach - 90) % 360
+    upper_bound = (normal_to_beach + 90) % 360
+
+    if lower_bound > upper_bound:
+        index = ((df[wind_direction_column] >= lower_bound) | (df[wind_direction_column] <= upper_bound))
+    else:
+        index = ((df[wind_direction_column] >= lower_bound) & (df[wind_direction_column] <= upper_bound))
+
+    return df[index]
+
+
+def wind_power(V):
+    return V ** 3
+
+
+def wind_energy(frequency, windpower):
+    return frequency * windpower
+
+
+def fetch_factor(fetchlength):
+    return fetchlength ** 0.333
+
+
+def get_e0(frequency, windpower, fetchfactor):
+    return (frequency * windpower * fetchfactor) / 1000
+
+
+def get_e(K, e0):
+    return K * e0
+
+
+def getenergy(V, frequency, fetchlength, K=1):
+    windpowert = wind_power(V)
+    windenergyt = wind_energy(frequency, windpowert)
+    fetchfactort = fetch_factor(fetchlength)
+    e0t = get_e0(frequency, windpowert, fetchfactort)
+    et = get_e(K, e0t)
+    return et
+
+
+def get_y0(normal_angle, rhumb_angle):
+    """Угол между нормалью и направлением ветра"""
+    rad1 = np.radians(normal_angle)
+    rad2 = np.radians(rhumb_angle)
+    diff = (rad1 - rad2) % (2 * np.pi)
+    y0 = np.degrees(np.where(diff > np.pi, diff - 2 * np.pi, diff))
+    return y0
+
+
+def get_alongc(y0):
+    """Коэффициент продольной составляющей"""
+    polarity = np.sign(y0)
+    y0 = np.abs(y0)
+    y0arr = np.array([0, 20, 40, 45, 50, 60, 90, 110, 120, 180])
+    Sarr = np.array([0, 0.63, 0.965, 1, 0.975, 0.87, 0.435, 0.135, 0, 0])
+    falong = interpolate.interp1d(
+        y0arr, Sarr,
+        kind='linear',
+        fill_value='extrapolate',
+        bounds_error=False
+    )
+    return polarity * falong(y0)
+
+
+def get_crossc(y0):
+    """Коэффициент поперечной составляющей"""
+    polarity = np.sign(y0)
+    y0 = np.abs(y0)
+    y0arr = np.array([0, 20, 45, 60, 90, 110, 120, 180])
+    Barr = np.array([1, 0.93, 0.71, 0.58, 0.28, 0.1, 0, 0])
+    fcross = interpolate.interp1d(
+        y0arr, Barr,
+        kind='linear',
+        fill_value='extrapolate',
+        bounds_error=False
+    )
+    return fcross(y0)
+
+
+def get_tforce(e, alongc):
+    return e * alongc
+
+
+def get_bforce(e, crossc):
+    return e * crossc
+
+
+def calculate_wind_frequencies_windrose_compatible(wind_speed, wind_direction, n_sectors, speed_bins):
+    """
+    Расчёт частот и средних скоростей по секторам, 
+    СОВМЕСТИМО с методом WindroseAxes.
+    """
+    sector_centers = np.linspace(0, 360, n_sectors, endpoint=False) + 360 / (2 * n_sectors)
+    
+    df_wind = pd.DataFrame({
+        'speed': wind_speed,
+        'direction': wind_direction
+    })
+    
+    df_wind['sector'] = df_wind['direction'].apply(
+        lambda x: min(sector_centers, key=lambda y: abs(x - y))
+    )
+    
+    grouped = df_wind.groupby('sector').agg({
+        'speed': ['count', 'mean']
+    }).reset_index()
+    
+    grouped.columns = ['sector', 'count', 'mean_speed']
+    grouped['freq'] = (grouped['count'] / len(df_wind)) * 100
+    
+    full_sectors = pd.DataFrame({'sector': sector_centers})
+    grouped_full = full_sectors.merge(grouped, on='sector', how='left')
+    grouped_full['count'] = grouped_full['count'].fillna(0)
+    grouped_full['freq'] = grouped_full['freq'].fillna(0)
+    grouped_full['mean_speed'] = grouped_full['mean_speed'].fillna(0)
+    
+    return (grouped_full['sector'].values,
+            grouped_full['freq'].values,
+            grouped_full['mean_speed'].values)
+
+
+def fetch_weather_data(lat, lon, year, month):
+    """Загрузка метеоданных из Open-Meteo API"""
+    cache_session = requests_cache.CachedSession('.cache', expire_after=-1)
+    retry_session = retry(cache_session, retries=5, backoff_factor=0.2)
+    openmeteo = openmeteo_requests.Client(session=retry_session)
+
+    url = "https://archive-api.open-meteo.com/v1/archive"
+
+    start_date = f"{year}-{month:02d}-01"
+
+    if month == 12:
+        end_date = f"{year}-12-31"
+    else:
+        next_month_start = pd.to_datetime(start_date) + pd.DateOffset(months=1)
+        end_date = (next_month_start - pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+
+    params = {
+        "latitude": lat,
+        "longitude": lon,
+        "start_date": start_date,
+        "end_date": end_date,
+        "hourly": ["wind_speed_10m", "wind_direction_10m"],
+        "wind_speed_unit": "ms",
+        "timezone": "UTC",
+        "models": "era5"
+    }
+
+    responses = openmeteo.weather_api(url, params=params)
+
+    if not responses:
+        raise RuntimeError(f"API вернул пустой ответ для {lat}, {lon}")
+
+    response = responses[0]
+    hourly = response.Hourly()
+
+    if hourly is None:
+        raise RuntimeError("Hourly данные не получены")
+
+    hourly_wind_speed_10m = hourly.Variables(0).ValuesAsNumpy()
+    hourly_wind_direction_10m = hourly.Variables(1).ValuesAsNumpy()
+
+    if len(hourly_wind_speed_10m) == 0:
+        raise RuntimeError("Получены пустые данные о ветре")
+
+    hourly_data = {
+        "date": pd.date_range(
+            start=pd.to_datetime(hourly.Time(), unit="s", utc=True),
+            end=pd.to_datetime(hourly.TimeEnd() - 1, unit="s", utc=True),
+            freq=pd.Timedelta(seconds=hourly.Interval())
+        ),
+        "speed": hourly_wind_speed_10m,
+        "direction": hourly_wind_direction_10m,
+    }
+
+    return pd.DataFrame(data=hourly_data)
+
+
+def process_point_month(row, year, month, weather_df, fetch_cache):
+    """
+    Расчёт энергии и сил для точки за месяц.
+    """
+    if weather_df is None or weather_df.empty:
+        return None
+
+    point_x = row['INSIDE_X']
+    point_y = row['INSIDE_Y']
+    normal_to_beach = row['BEARING']
+
+    ws = weather_df["speed"].values
+    wd = weather_df["direction"].values
+
+    directions, frequencies, mean_speeds = calculate_wind_frequencies_windrose_compatible(
+        ws, wd, rhumb_sectors, speed_bins
+    )
+
+    cache_key = (point_x, point_y)
+    if cache_key in fetch_cache:
+        fetch_directions, fetch_distances = fetch_cache[cache_key]
+    else:
+        fetch_angles_fallback = np.linspace(0, 360, rhumb_sectors, endpoint=False) + 360 / (2 * rhumb_sectors)
+        fetch_directions, fetch_distances = get_fetch_distances(
+            point_x, point_y, fetch_angles_fallback, shoreline_union
+        )
+
+    result_df = pd.DataFrame({
+        'dir': directions,
+        'freq': frequencies / 100,
+        'V': mean_speeds,
+        'D': fetch_distances
+    })
+
+    result_df['Energy'] = getenergy(
+        V=result_df['V'],
+        frequency=result_df['freq'],
+        fetchlength=result_df['D'],
+        K=1
+    )
+    result_df['y0'] = get_y0(normal_angle=normal_to_beach, rhumb_angle=result_df['dir'])
+    result_df['alongc'] = get_alongc(y0=result_df['y0'])
+    result_df['crossc'] = get_crossc(y0=result_df['y0'])
+    result_df['t'] = get_tforce(e=result_df['Energy'], alongc=result_df['alongc'])
+    result_df['b'] = get_bforce(e=result_df['Energy'], crossc=result_df['crossc'])
+
+    result_df.replace([np.inf, -np.inf], np.nan, inplace=True)
+    result_df.fillna(0, inplace=True)
+
+    awd = filter_active_rumbs(result_df, normal_to_beach, wind_direction_column='dir')
+    df_copy = awd.copy()
+    df_copy['t'].fillna(0, inplace=True)
+
+    T1 = (df_copy['t'][df_copy['t'] > 0]).sum()
+    T2 = (df_copy['t'][df_copy['t'] < 0]).sum()
+    T = T1 + T2
+    A = np.abs(T1) + np.abs(T2)
+    B = df_copy['b'].sum()
+
+    if B != 0:
+        E = np.sqrt(T**2 + B**2)
+        t_ratio = T / B
+        theta_deg = np.rad2deg(np.arctan2(T, B))
+    else:
+        E = 0
+        t_ratio = 0
+        theta_deg = 0
+
+    thau360 = (normal_to_beach + theta_deg) % 360
+
+    output = {
+        'point_x': point_x,
+        'point_y': point_y,
+        'year': year,
+        'month': f"{month:02d}",
+        'era_lat': row['NEAR_Y_1'],
+        'era_long': row['NEAR_X_1'],
+        'normal_to_beach': normal_to_beach,
+        'T1': T1,
+        'T2': T2,
+        'T': T,
+        'A': A,
+        'B': B,
+        'E': E,
+        't_ratio': t_ratio,
+        'theta_deg': theta_deg,
+        'thau360': thau360,
+    }
+
+    return output
+
+
+print("\n" + "=" * 80)
+print("НАЧАЛО РАСЧЕТОВ")
+print("=" * 80)
+
+outlist = []
+
+unique_points = calc_gdf[['NEAR_X_1', 'NEAR_Y_1']].drop_duplicates().values
+print(f"\nУникальные точки метеоданных: {len(unique_points)}")
+
+weather_cache = {}
+total_calcs = 0
+successful_calcs = 0
+failed_calcs = 0
+
+try:
+    for year_idx, year in enumerate(years_range):
+        for month_idx, month in enumerate(months_range):
+            print(f"\n[{year_idx+1}/{len(years_range)}] [{month_idx+1}/{len(months_range)}] {year}-{month:02d}", end=" | ")
+
+            for era_lon, era_lat in unique_points:
+                cache_key = (era_lat, era_lon, year, month)
+
+                if cache_key not in weather_cache:
+                    try:
+                        weather_data = fetch_weather_data(era_lat, era_lon, year, month)
+                        weather_cache[cache_key] = weather_data
+                    except Exception as e:
+                        print(f"\n[ERR] Метеоданные ({era_lat}, {era_lon}) за {year}-{month:02d}: {e}")
+                        weather_cache[cache_key] = None
+                        continue
+
+            for idx, row in calc_gdf.iterrows():
+                cache_key = (row['NEAR_Y_1'], row['NEAR_X_1'], year, month)
+                weather_data = weather_cache.get(cache_key)
+
+                try:
+                    result = process_point_month(row, year, month, weather_data, fetch_cache)
+                    if result is not None:
+                        outlist.append(result)
+                        successful_calcs += 1
+                except Exception as e:
+                    print(f"\n[ERR] Расчет ({row['INSIDE_X']}, {row['INSIDE_Y']}): {e}")
+                    traceback.print_exc()
+                    failed_calcs += 1
+                    raise
+
+                total_calcs += 1
+
+            print(f"✓ {successful_calcs} расчетов")
+
+except KeyboardInterrupt:
+    print("\n\n[!!!] Прерывание пользователем")
+except Exception as e:
+    print(f"\n\n[!!!] КРИТИЧЕСКАЯ ОШИБКА: {e}")
+
+print("\n" + "=" * 80)
+print("ЗАВЕРШЕНИЕ И СОХРАНЕНИЕ")
+print("=" * 80)
+print(f"Всего расчетов: {total_calcs}")
+print(f"Успешных: {successful_calcs}")
+print(f"Ошибок: {failed_calcs}")
+
+if outlist:
+    result_df = pd.DataFrame(outlist)
+    
+    # ============ СОХРАНЕНИЕ В ОДИН ФАЙЛ ============
+    result_df['date'] = result_df['year'].astype(str) + '-' + result_df['month'].astype(str)
+    
+    # Сохраняем CSV (один файл для всех лет и месяцев)
+    csv_filename = 'knaps_results_all_years75.csv'
+    result_df.to_csv(csv_filename, index=False)
+    print(f"\n✓ CSV сохранен: {csv_filename}")
+    
+    # Сохраняем Shapefile (один файл для всех лет и месяцев)
+    result_gdf = gpd.GeoDataFrame(
+        result_df,
+        geometry=gpd.points_from_xy(result_df.point_x, result_df.point_y),
+        crs="EPSG:32634"
+    )
+    shp_filename = 'knaps_results_all_years75st.shp'
+    result_gdf.to_file(shp_filename)
+    print(f"✓ Shapefile сохранен: {shp_filename}")
+    
+    # Дополнительно: сохраняем Excel для лучшей читаемости
+    excel_filename = 'knaps_results_all_years75st.xlsx'
+    result_df_excel = result_df.drop(columns=['geometry'], errors='ignore')
+    result_df_excel.to_excel(excel_filename, index=False, sheet_name='Results')
+    print(f"✓ Excel сохранен: {excel_filename}")
+
+    print(f"\nВсего записей в результатах: {len(outlist)}")
+    print(f"Годы: {sorted(result_df['year'].unique())}")
+    print(f"Месяцы: {sorted(result_df['month'].unique())}")
+    
+    print("\nПримеры первых 5 записей:")
+    print(result_df.head())
+    
+    print("\nИтоговая статистика:")
+    print(f"  Уникальные точки: {result_df['point_x'].nunique()}")
+    print(f"  Годов обработано: {result_df['year'].nunique()}")
+    print(f"  Месяцев обработано: {result_df['month'].nunique()}")
+else:
+    print("\n[!!!] НЕТ РЕЗУЛЬТАТОВ")
